@@ -1,77 +1,166 @@
 // path: services/paymentService.js
-import logger from '../utils/logger.js';
-import config from '../config/index.js';
-import wooService from './wooService.js';
-import OrderRecord from '../models/OrderRecord.js';
-
 /**
- * Provides payment-link creation and verification.
+ * Unified Payment Service
  *
- * NOTE: WooCommerce REST API itself doesn't provide payment links out-of-the-box. Common approaches:
- * - Create an order and provide the order pay URL if WooCommerce site supports "Pay for order" endpoint.
- * - Use a payment gateway's hosted payment link (e.g., Stripe Checkout) and provide that link.
+ * Wraps provider-specific implementations (stripeService, razorpayService) and centralizes:
+ *  - checkout creation
+ *  - webhook verification dispatch
+ *  - unified event handling and persistence to PaymentRecord
+ *  - reconciliation with OrderRecord and Workflows
  *
- * Here we implement a generic approach:
- * 1) createOrderInWoo: create a pending order in WooCommerce (payment_method = 'bacs' or custom)
- * 2) buildPayUrl: construct pay URL if site supports it: {WC_BASE_URL}/?wc-api=paypal&... (this depends on site)
- *
- * For production, integrate directly with a gateway (Stripe/PayPal) to generate payment sessions.
+ * Exports:
+ *  - createCheckoutSession(provider, payload)
+ *  - verifyAndHandleWebhook(provider, rawBody, signatureHeader)
+ *  - retrievePayment(provider, id)
  */
 
-function buildPayUrl(wooOrder) {
-  // Many WooCommerce sites allow order pay via endpoint: /checkout/order-pay/{order_id}/?pay_for_order=true&key={order_key}
-  const base = config.wooCommerce.baseUrl.replace(/\/$/, '');
-  if (!wooOrder || !wooOrder.id || !wooOrder.order_key) return null;
-  return `${base}/checkout/order-pay/${wooOrder.id}/?pay_for_order=true&key=${wooOrder.order_key}`;
+import stripeService from './stripeService.js';
+import razorpayService from './razorpayService.js';
+import PaymentRecord from '../models/PaymentRecord.js';
+import OrderRecord from '../models/OrderRecord.js';
+import Workflow from '../models/Workflow.js';
+import logger from '../utils/logger.js';
+
+/**
+ * Create checkout session (provider: 'stripe' | 'razorpay')
+ */
+export async function createCheckoutSession(provider, payload) {
+  if (!provider) throw new Error('provider required');
+  if (provider === 'stripe') {
+    return stripeService.createCheckoutSession(payload);
+  }
+  if (provider === 'razorpay') {
+    // For razorpay, createOrder then return order details for client to use
+    return razorpayService.createOrder(payload);
+  }
+  throw new Error(`Unsupported payment provider: ${provider}`);
 }
 
-async function createOrderAndPaymentLink({ customer, items = [], shipping = {}, billing = {} } = {}) {
-  // Build order payload following WooCommerce API schema
-  const line_items = items.map((it) => ({
-    product_id: it.product_id,
-    variation_id: it.variation_id || undefined,
-    quantity: it.quantity || 1
-  }));
-
-  const orderPayload = {
-    payment_method: 'bacs',
-    payment_method_title: 'Bank Transfer',
-    set_paid: false,
-    billing: billing || {},
-    shipping: shipping || {},
-    line_items,
-    customer_note: `Created via WhatsApp assistant for ${customer?.phone || 'unknown'}`
-  };
-
+/**
+ * Verify webhook signature and process event for provider
+ * - rawBody: Buffer or string
+ * - signatureHeader: provider signature header value
+ *
+ * Returns the persisted PaymentRecord
+ */
+export async function verifyAndHandleWebhook(provider, rawBody, signatureHeader) {
   try {
-    const wooOrder = await wooService.createOrder(orderPayload);
-    // persist
-    await OrderRecord.create({
-      wooOrderId: wooOrder.id,
-      customerPhone: customer?.phone,
-      status: wooOrder.status,
-      total: parseFloat(wooOrder.total || 0),
-      currency: wooOrder.currency,
-      items: wooOrder.line_items || [],
-      raw: wooOrder
-    });
+    let event = null;
+    if (provider === 'stripe') {
+      event = stripeService.verifyWebhook(rawBody, signatureHeader);
+      // Extract sensible fields
+      const data = event.data?.object || {};
+      const providerEventId = event.id;
+      const amount = (data.amount || data.amount_total || data.amount_paid) || null;
+      const currency = data.currency || null;
+      const orderId = data.metadata?.orderId || data.metadata?.order_id || null;
+      const status = data.status || event.type;
+      const rec = await PaymentRecord.recordEvent({
+        provider: 'stripe',
+        providerEventId,
+        orderId,
+        amount,
+        currency,
+        status,
+        rawEvent: event
+      });
 
-    const payUrl = buildPayUrl(wooOrder);
-    return { wooOrder, payUrl };
+      // Try reconciliation
+      if (orderId) {
+        try {
+          const order = await OrderRecord.findOne({ orderId }) || await OrderRecord.findById(orderId).catch(() => null);
+          if (order) {
+            order.payment = order.payment || {};
+            order.payment.provider = 'stripe';
+            order.payment.providerEventId = providerEventId;
+            order.payment.status = status;
+            await order.save();
+          }
+        } catch (e) {
+          logger.warn('Payment service reconciliation (stripe) failed', { orderId, error: e.message });
+        }
+      }
+
+      // Link to workflow by correlationId (if present)
+      if (orderId) {
+        try {
+          const wf = await Workflow.findOne({ correlationId: String(orderId) });
+          if (wf) await wf.appendLog('info', 'Stripe payment event processed', { providerEventId, status });
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      return rec;
+    }
+
+    if (provider === 'razorpay') {
+      const rawString = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8');
+      // Verify signature
+      const valid = razorpayService.verifySignature(rawString, signatureHeader);
+      if (!valid) throw new Error('Invalid Razorpay signature');
+      const event = JSON.parse(rawString);
+      const providerEventId = event?.payload?.payment?.entity?.id || event?.payload?.order?.entity?.id || event.event;
+      const amount = event?.payload?.payment?.entity?.amount ? event.payload.payment.entity.amount / 100 : null;
+      const currency = event?.payload?.payment?.entity?.currency || null;
+      const orderId = event?.payload?.payment?.entity?.notes?.order_id || null;
+      const status = event?.event || (event?.payload?.payment?.entity?.status) || null;
+
+      const rec = await PaymentRecord.recordEvent({
+        provider: 'razorpay',
+        providerEventId,
+        orderId,
+        amount,
+        currency,
+        status,
+        rawEvent: event
+      });
+
+      if (orderId) {
+        try {
+          const order = await OrderRecord.findOne({ orderId }) || await OrderRecord.findById(orderId).catch(() => null);
+          if (order) {
+            order.payment = order.payment || {};
+            order.payment.provider = 'razorpay';
+            order.payment.providerEventId = providerEventId;
+            order.payment.status = status;
+            await order.save();
+          }
+        } catch (e) {
+          logger.warn('Razorpay reconciliation failed', { orderId, error: e.message });
+        }
+      }
+
+      if (orderId) {
+        try {
+          const wf = await Workflow.findOne({ correlationId: String(orderId) });
+          if (wf) await wf.appendLog('info', 'Razorpay payment event processed', { providerEventId, status });
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      return rec;
+    }
+
+    throw new Error(`Unsupported provider: ${provider}`);
   } catch (err) {
-    logger.error('createOrderAndPaymentLink error', err);
+    logger.error('verifyAndHandleWebhook error', { provider, error: err.message });
     throw err;
   }
 }
 
-async function getOrderStatus(wooOrderId) {
-  try {
-    const order = await wooService.getOrder(wooOrderId);
-    return order;
-  } catch (err) {
-    logger.error('getOrderStatus error', err);
-    throw err;
-  }
+/**
+ * Retrieve payment / reconciliation info
+ */
+export async function retrievePayment(provider, id) {
+  if (provider === 'stripe') return stripeService.retrievePaymentIntent(id);
+  if (provider === 'razorpay') return razorpayService.fetchPayment(id);
+  throw new Error(`Unsupported provider: ${provider}`);
 }
 
-export default { createOrderAndPaymentLink, getOrderStatus };
+export default {
+  createCheckoutSession,
+  verifyAndHandleWebhook,
+  retrievePayment
+};
