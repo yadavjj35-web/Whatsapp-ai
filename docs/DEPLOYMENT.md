@@ -30,3 +30,11 @@ This document outlines recommended deployment steps for production.
 
 6. Backups
    - Regularly backup MongoDB and store backups offsite.
+
+Enterprise Notes & Next Steps
+
+1. Replace placeholder implementations for Amazon SP-API, n8n creation APIs, and email provider with production SDKs.
+2. Configure OWNER_IDS, N8N_WEBHOOK_BASE_URL, AMAZON_SP_API_BASE, EXECUTION_CONCURRENCY in environment.
+3. Consider persistent storage for approvals, workflows, and vector memory (e.g., Redis, Pinecone).
+4. Add RBAC backed by a proper identity provider (Keycloak, Auth0).
+5. Integrate observability: Prometheus exporters, centralized logging, and alerting.
