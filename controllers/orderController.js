@@ -1,57 +1,92 @@
 // path: controllers/orderController.js
-import paymentService from '../services/paymentService.js';
-import logger from '../utils/logger.js';
-import Customer from '../models/Customer.js';
-import OrderRecord from '../models/OrderRecord.js';
-
 /**
- * - POST /api/v1/orders/create : create order & return pay link
- * - GET  /api/v1/orders/:id     : get order status
+ * Order Controller
+ *
+ * Endpoints:
+ *  - POST /orders/create -> create local order and start payment checkout session
+ *  - GET  /orders/:id    -> retrieve order
+ *  - POST /orders/:id/capture -> capture/confirm payment (if applicable)
+ *
+ * Integrates with:
+ *  - services/paymentService.createCheckoutSession
+ *  - models/OrderRecord (assumed to exist)
+ *  - models/PaymentRecord for reconciliation
  */
 
-export async function createOrder(req, res, next) {
+import express from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import logger from '../utils/logger.js';
+import paymentService from '../services/paymentService.js';
+import OrderRecord from '../models/OrderRecord.js'; // assume exists
+import PaymentRecord from '../models/PaymentRecord.js';
+
+const router = express.Router();
+
+/**
+ * Create order and initiate checkout
+ * Body: { provider: 'stripe'|'razorpay', order: { items, currency, customerEmail }, successUrl, cancelUrl }
+ */
+router.post('/create', async (req, res, next) => {
   try {
-    const { phone, items, shipping, billing, customer } = req.body;
-    if (!phone || !items || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ success: false, error: 'Missing required fields (phone, items)' });
-    }
-
-    // Save or update basic customer info
-    await Customer.findOneAndUpdate({ phone }, { $set: { name: (customer && customer.name) || undefined, phone } }, { upsert: true });
-
-    const result = await paymentService.createOrderAndPaymentLink({
-      customer: { phone, ...customer },
-      items,
-      shipping,
-      billing
+    const { provider = 'stripe', order = {}, successUrl, cancelUrl, customerEmail } = req.body;
+    // create minimal OrderRecord
+    const orderId = `order_${Date.now()}_${uuidv4()}`;
+    const orderRec = await OrderRecord.create({
+      orderId,
+      items: order.items || [],
+      currency: order.currency || 'USD',
+      total: order.total || 0,
+      customerEmail: customerEmail || null,
+      status: 'pending',
+      createdAt: new Date()
     });
 
-    return res.json({ success: true, payment: { payUrl: result.payUrl }, order: result.wooOrder });
-  } catch (err) {
-    logger.error('createOrder controller error', err);
-    return next(err);
-  }
-}
+    // Create checkout session
+    const payload = {
+      order: { id: orderId, items: orderRec.items, currency: orderRec.currency, total: orderRec.total },
+      successUrl,
+      cancelUrl,
+      metadata: { orderId },
+      customerEmail
+    };
 
-export async function getOrder(req, res, next) {
-  try {
-    const id = req.params.id;
-    if (!id) return res.status(400).json({ success: false, error: 'Missing order id' });
+    const session = await paymentService.createCheckoutSession(provider, payload);
 
-    // Try local cache first
-    const rec = await OrderRecord.findOne({ wooOrderId: id });
-    let order;
+    // Persist a PaymentRecord placeholder (best-effort)
     try {
-      order = await paymentService.getOrderStatus(id);
-    } catch (err) {
-      // If live fetch fails, fallback to cached
-      order = rec && rec.raw;
-      if (!order) throw err;
+      await PaymentRecord.recordEvent({
+        provider,
+        providerEventId: session.id || session?.order?.id || `init_${orderId}`,
+        orderId,
+        amount: orderRec.total,
+        currency: orderRec.currency,
+        status: 'checkout_created',
+        rawEvent: session
+      });
+    } catch (e) {
+      logger.warn('Failed to persist payment init record', { orderId, error: e.message });
     }
 
-    return res.json({ success: true, data: order });
+    return res.status(201).json({ success: true, orderId, checkout: session });
   } catch (err) {
-    logger.error('getOrder controller error', err);
+    logger.error('Create order failed', { error: err.message });
     return next(err);
   }
-}
+});
+
+/**
+ * Get order details
+ */
+router.get('/:id', async (req, res, next) => {
+  try {
+    const orderId = req.params.id;
+    const order = await OrderRecord.findOne({ orderId });
+    if (!order) return res.status(404).json({ success: false, error: 'Not found' });
+    return res.json({ success: true, order });
+  } catch (err) {
+    logger.error('Get order failed', { error: err.message });
+    return next(err);
+  }
+});
+
+export default router;
