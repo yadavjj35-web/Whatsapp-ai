@@ -1,0 +1,130 @@
+########################################
+# SERVER
+########################################
+PORT=3000
+NODE_ENV=development
+
+########################################
+# DATABASE
+########################################
+MONGO_URI=
+
+########################################
+# JWT
+########################################
+JWT_SECRET=change_this_to_a_long_random_secret
+JWT_EXPIRES_IN=7d
+
+########################################
+# GOOGLE GEMINI AI
+########################################
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-1.5-flash
+
+########################################
+# WHATSAPP CLOUD API
+########################################
+WHATSAPP_VERIFY_TOKEN=
+WHATSAPP_TOKEN=
+WHATSAPP_PHONE_NUMBER_ID=
+WHATSAPP_APP_SECRET=
+WHATSAPP_API_VERSION=v17.0
+
+########################################
+# WOOCOMMERCE
+########################################
+WC_BASE_URL=
+WC_CONSUMER_KEY=
+WC_CONSUMER_SECRET=
+
+########################################
+# AMAZON SP API
+########################################
+AMAZON_SP_API_BASE=https://sellingpartnerapi-na.amazon.com
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+LWA_CLIENT_ID=
+LWA_CLIENT_SECRET=
+SP_API_REFRESH_TOKEN=
+SP_API_ROLE_ARN=
+AMAZON_SELLER_ID=
+AMAZON_MARKETPLACE_ID=
+
+########################################
+# N8N
+########################################
+N8N_WEBHOOK_BASE_URL=
+N8N_API_KEY=
+
+########################################
+# OWNER SETTINGS
+########################################
+OWNER_IDS=
+OWNER_PHONE=
+OWNER_EMAIL=
+API_KEYS=
+
+########################################
+# PAYMENT
+########################################
+PAYMENT_PROVIDER=razorpay
+
+RAZORPAY_KEY=
+RAZORPAY_SECRET=
+
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=
+
+########################################
+# EMAIL
+########################################
+EMAIL_PROVIDER=
+
+SENDGRID_API_KEY=
+
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASS=
+
+########################################
+# LOGGING
+########################################
+LOG_LEVEL=info
+
+########################################
+# MONITORING
+########################################
+SENTRY_DSN=
+NEW_RELIC_LICENSE_KEY=
+PROMETHEUS_ENABLED=false
+METRICS_PORT=9090
+
+########################################
+# SECURITY
+########################################
+BLOCKED_AGENTS=
+EXECUTION_CONCURRENCY=4
+RATE_LIMIT_WINDOW_MS=60000
+RATE_LIMIT_MAX=60
+OWNER_APPROVAL_REQUIRED=true
+
+########################################
+# OPTIONAL INTEGRATIONS
+########################################
+GOOGLE_DRIVE_API_KEY=
+GOOGLE_SHEETS_API_KEY=
+SLACK_BOT_TOKEN=
+SLACK_SIGNING_SECRET=
+TELEGRAM_BOT_TOKEN=
+MICROSOFT_TEAMS_WEBHOOK=
+HUBSPOT_API_KEY=
+ZOHO_CLIENT_ID=
+ZOHO_CLIENT_SECRET=
+SHIPROCKET_API_KEY=
+DELHIVERY_API_KEY=
+
+########################################
+# INTERNAL
+########################################
+EXECUTION_QUEUE_CONCURRENCY=4
