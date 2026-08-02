@@ -1,130 +1,184 @@
-########################################
-# SERVER
-########################################
+# .env.example - copy to .env and fill in secrets & endpoints before running
+#
+# Usage:
+#  cp .env.example .env
+#  # edit .env to add real secret values (do NOT commit .env)
+#
+# Note: Values shown as <> are placeholders and MUST be replaced.
+
+####################
+# Basic app config
+####################
+NODE_ENV=production
+SERVICE_NAME=whatsapp-ai
 PORT=3000
-NODE_ENV=development
+APP_URL=https://whatsapp-ai.example.com           # public app base URL
+APPROVAL_BASE_URL=${APP_URL}                      # used to build signed approval links
+APPROVAL_ACCEPT_PATH=/api/v1/approvals/accept
+URL_SIGNING_SECRET=<random-32+char-secret>        # REQUIRED: HMAC secret for signed links
 
-########################################
-# DATABASE
-########################################
-MONGO_URI=
+####################
+# Datastores & Queue
+####################
+MONGODB_URI=mongodb://mongo:27017/whatsapp-ai
+REDIS_URL=redis://redis:6379
+QUEUE_PREFIX=waai
+QUEUE_NAME_TASKS=tasks
 
-########################################
-# JWT
-########################################
-JWT_SECRET=change_this_to_a_long_random_secret
-JWT_EXPIRES_IN=7d
+####################
+# Vector DB / Embeddings
+####################
+# Choose either QDRANT or PINECONE depending on deployment:
+VECTOR_DB=qdrant                                 # qdrant | pinecone
+QDRANT_URL=http://qdrant:6333
+QDRANT_API_KEY=                                    # optional
+PINECONE_API_KEY=
+PINECONE_ENV=
+PINECONE_INDEX=waai-index
 
-########################################
-# GOOGLE GEMINI AI
-########################################
-GEMINI_API_KEY=
-GEMINI_MODEL=gemini-1.5-flash
+# Embedding config
+EMBED_BATCH_SIZE=16
+EMBEDDING_CACHE_TTL_MS=3600000   # 1 hour
+EMBEDDING_CACHE_MAX_ENTRIES=10000
 
-########################################
-# WHATSAPP CLOUD API
-########################################
-WHATSAPP_VERIFY_TOKEN=
-WHATSAPP_TOKEN=
-WHATSAPP_PHONE_NUMBER_ID=
-WHATSAPP_APP_SECRET=
-WHATSAPP_API_VERSION=v17.0
+####################
+# Gemini / LLM
+####################
+GEMINI_API_KEY=<your-gemini-api-key>              # REQUIRED for LLM calls
+GEMINI_MODEL=gemini-1.5
+GEMINI_ENDPOINT=https://gemini.googleapis.com/v1/models
+GEMINI_TIMEOUT_MS=20000
+GEMINI_EMBED_MODEL=gemini-1-embed                 # optional: model for embeddings
 
-########################################
-# WOOCOMMERCE
-########################################
-WC_BASE_URL=
-WC_CONSUMER_KEY=
-WC_CONSUMER_SECRET=
+####################
+# Payments
+####################
+# Stripe
+STRIPE_SECRET_KEY=<stripe-secret-key>
+STRIPE_WEBHOOK_SECRET=<stripe-webhook-secret>
 
-########################################
-# AMAZON SP API
-########################################
-AMAZON_SP_API_BASE=https://sellingpartnerapi-na.amazon.com
-AWS_ACCESS_KEY_ID=
-AWS_SECRET_ACCESS_KEY=
-LWA_CLIENT_ID=
-LWA_CLIENT_SECRET=
-SP_API_REFRESH_TOKEN=
-SP_API_ROLE_ARN=
-AMAZON_SELLER_ID=
-AMAZON_MARKETPLACE_ID=
+# Razorpay
+RAZORPAY_KEY=<razorpay-key>
+RAZORPAY_SECRET=<razorpay-secret>
 
-########################################
-# N8N
-########################################
-N8N_WEBHOOK_BASE_URL=
+####################
+# Amazon SP-API (for catalog / feeds)
+####################
+LWA_CLIENT_ID=<lwa-client-id>
+LWA_CLIENT_SECRET=<lwa-client-secret>
+SP_API_REFRESH_TOKEN=<sp-api-refresh-token>
+AWS_ACCESS_KEY_ID=<aws-access-key-id>
+AWS_SECRET_ACCESS_KEY=<aws-secret-access-key>
+AWS_REGION=us-east-1
+SP_API_ROLE_ARN=                                  # optional: if you must assume role for SP-API
+AMAZON_MARKETPLACE_ID=<marketplace-id>
+AMAZON_SELLER_ID=<seller-id>
+
+####################
+# CRM & Automation
+####################
+# HubSpot
+HUBSPOT_ACCESS_TOKEN=                              # preferred
+HUBSPOT_API_KEY=
+
+# Zoho
+ZOHO_ACCESS_TOKEN=
+ZOHO_ORG_ID=
+
+# n8n
+N8N_WEBHOOK_BASE_URL=https://hooks.example.com
+N8N_API_BASE_URL=https://n8n.example.com
 N8N_API_KEY=
 
-########################################
-# OWNER SETTINGS
-########################################
-OWNER_IDS=
-OWNER_PHONE=
-OWNER_EMAIL=
-API_KEYS=
+####################
+# OIDC / Auth
+####################
+OIDC_ISSUER=https://accounts.example.com
+OIDC_JWKS_URI=                                    # optional (if issuer not provided)
+OIDC_AUDIENCE=your-client-id
 
-########################################
-# PAYMENT
-########################################
-PAYMENT_PROVIDER=razorpay
+####################
+# Secrets & secrets manager
+####################
+# Set SECRETS_PROVIDER=aws to enable AWS Secrets Manager (requires AWS creds above)
+SECRETS_PROVIDER=env
+SECRETS_CACHE_TTL_MS=600000
 
-RAZORPAY_KEY=
-RAZORPAY_SECRET=
-
-STRIPE_SECRET_KEY=
-STRIPE_WEBHOOK_SECRET=
-
-########################################
-# EMAIL
-########################################
-EMAIL_PROVIDER=
-
-SENDGRID_API_KEY=
-
-SMTP_HOST=
-SMTP_PORT=587
-SMTP_USER=
-SMTP_PASS=
-
-########################################
-# LOGGING
-########################################
+####################
+# Logging & Shipper
+####################
 LOG_LEVEL=info
+LOGSHIP_URL=                                      # e.g., https://log-collector.example.com/ingest
+LOGSHIP_BATCH_SIZE=50
+LOGSHIP_BATCH_INTERVAL_MS=5000
 
-########################################
-# MONITORING
-########################################
-SENTRY_DSN=
-NEW_RELIC_LICENSE_KEY=
-PROMETHEUS_ENABLED=false
-METRICS_PORT=9090
+####################
+# Observability / Tracing / Metrics
+####################
+OTEL_ENABLED=true
+OTEL_SERVICE_NAME=whatsapp-ai
+OTEL_EXPORTER_OTLP_ENDPOINT=                      # e.g., http://otel-collector:4318/v1/traces
+METRICS_PREFIX=waai_
+METRICS_HISTOGRAM_BUCKETS=0.005,0.01,0.05,0.1,0.5,1,2,5
 
-########################################
-# SECURITY
-########################################
-BLOCKED_AGENTS=
-EXECUTION_CONCURRENCY=4
-RATE_LIMIT_WINDOW_MS=60000
-RATE_LIMIT_MAX=60
-OWNER_APPROVAL_REQUIRED=true
+####################
+# Rate limits & quotas
+####################
+RATE_LIMIT_POINTS=100
+RATE_LIMIT_DURATION=60
+RATE_LIMIT_BLOCK_DURATION=60
+RATE_LIMIT_PREFIX=rl
 
-########################################
-# OPTIONAL INTEGRATIONS
-########################################
-GOOGLE_DRIVE_API_KEY=
-GOOGLE_SHEETS_API_KEY=
-SLACK_BOT_TOKEN=
-SLACK_SIGNING_SECRET=
-TELEGRAM_BOT_TOKEN=
-MICROSOFT_TEAMS_WEBHOOK=
-HUBSPOT_API_KEY=
-ZOHO_CLIENT_ID=
-ZOHO_CLIENT_SECRET=
-SHIPROCKET_API_KEY=
-DELHIVERY_API_KEY=
+AI_RATE_LIMIT_TOKENS=1000000           # tokens allowed per window
+AI_RATE_LIMIT_WINDOW_SEC=86400         # window (seconds) e.g., 1 day
+AI_RATE_LIMIT_PREFIX=aiquota:
 
-########################################
-# INTERNAL
-########################################
-EXECUTION_QUEUE_CONCURRENCY=4
+####################
+# Worker & Queue tuning
+####################
+WORKER_CONCURRENCY=4
+WORKER_LOCK_TTL_MS=60000
+WORKER_SHUTDOWN_TIMEOUT_MS=30000
+QUEUE_SHUTDOWN_TIMEOUT_MS=30000
+
+####################
+# Idempotency / Redlock / Distributed locks
+####################
+REDLOCK_RETRY_COUNT=3
+REDLOCK_RETRY_DELAY_MS=200
+REDLOCK_RETRY_JITTER_MS=100
+IDEMPOTENCY_LOCK_PREFIX=idem:lock:
+IDEMPOTENCY_RESULT_PREFIX=idem:res:
+
+####################
+# Cache / Fallback
+####################
+CACHE_FALLBACK_MAX_ENTRIES=5000
+CACHE_FALLBACK_TTL_MS=3600000
+
+####################
+# Feature flags / role config
+####################
+# You can keep feature flags in config/feature-flags.json or set FF_<NAME>=true in env
+# Example: FF_NEW_CHAT_FLOW=true
+
+####################
+# Billing / Pricing
+####################
+PRICE_PER_1000_TOKENS=0.001      # example: $0.001 per 1k tokens (set to actual pricing)
+
+####################
+# CI / CD related
+####################
+# For GitHub Actions: set these secrets in your repo settings (not in .env)
+# - GITHUB_TOKEN (automatically available)
+# - KUBE_CONFIG_DATA (base64 of kubeconfig) for CD
+# - REGISTRY credentials if pushing to private registry
+
+####################
+# Misc / Helpers
+####################
+SERVICE_URL=${APP_URL}
+DEFAULT_TIMEOUT_MS=20000
+
+# End of file
