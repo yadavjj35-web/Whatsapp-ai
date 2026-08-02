@@ -1,112 +1,81 @@
 // path: services/wooService.js
-import axios from 'axios';
-import qs from 'qs';
-import config from '../config/index.js';
-import logger from '../utils/logger.js';
-
 /**
- * Simple WooCommerce wrapper using consumer key/secret query params for basic auth.
- * For production, prefer HTTPS + OAuth or server-to-server credentials.
+ * WooCommerce Service wrapper
+ *
+ * - Provides resilient API calls to WooCommerce REST API using axios
+ * - Adds retry and circuit breaker protections
+ *
+ * Exports:
+ *  - getOrder(orderId)
+ *  - createOrder(order)
+ *  - updateInventory(sku, qty)
  */
 
-function baseClient() {
-  const baseUrl = config.wooCommerce.baseUrl;
-  if (!baseUrl || !config.wooCommerce.consumerKey || !config.wooCommerce.consumerSecret) {
-    throw new Error('WooCommerce credentials not configured');
-  }
+import axios from 'axios';
+import retryWrapper from '../utils/retryWrapper.js';
+import circuitBreakerUtil from '../utils/circuitBreaker.js';
+import logger from '../utils/logger.js';
 
-  const client = axios.create({
-    baseURL: `${baseUrl}/wp-json/wc/v3`,
-    timeout: 15000
+const WOO_API_BASE = process.env.WOO_API_BASE || '';
+const WOO_KEY = process.env.WOO_KEY || '';
+const WOO_SECRET = process.env.WOO_SECRET || '';
+
+if (!WOO_API_BASE) logger.warn('WOO_API_BASE not configured; wooService will fail until set');
+
+function buildClient() {
+  return axios.create({
+    baseURL: WOO_API_BASE,
+    timeout: Number(process.env.WOO_TIMEOUT_MS || 8000),
+    auth: WOO_KEY && WOO_SECRET ? { username: WOO_KEY, password: WOO_SECRET } : undefined
   });
-
-  client.interceptors.request.use((req) => {
-    // Append auth to query
-    req.params = req.params || {};
-    req.params.consumer_key = config.wooCommerce.consumerKey;
-    req.params.consumer_secret = config.wooCommerce.consumerSecret;
-    // Use qs to properly serialize arrays if needed
-    req.paramsSerializer = (p) => qs.stringify(p, { arrayFormat: 'repeat' });
-    return req;
-  });
-
-  return client;
 }
 
-async function searchProducts(query, { perPage = 10, page = 1, category = null } = {}) {
-  const client = baseClient();
-  const params = { search: query, per_page: perPage, page };
-  if (category) params.category = category;
-
+/**
+ * Generic call with retry and circuit breaker
+ */
+async function callWithResilience(fn, opts = {}) {
+  const breaker = circuitBreakerUtil.createCircuitBreaker(fn, opts.circuit || {});
   try {
-    const resp = await client.get('/products', { params });
-    return resp.data;
+    return await breaker.fire();
   } catch (err) {
-    logger.error('Woo searchProducts error', { message: err.message });
-    throw err;
+    // fallback to retry wrapper if breaker rejects
+    logger.warn('Circuit breaker fired, attempting retry wrapper', { error: err.message });
+    return retryWrapper(fn, { attempts: opts.attempts || 3, baseDelayMs: opts.baseDelayMs || 300 });
   }
 }
 
-async function getProductById(id) {
-  const client = baseClient();
-  try {
-    const resp = await client.get(`/products/${id}`);
+export async function getOrder(orderId) {
+  if (!orderId) throw new Error('orderId required');
+  const fn = async () => {
+    const client = buildClient();
+    const resp = await client.get(`/orders/${encodeURIComponent(orderId)}`);
     return resp.data;
-  } catch (err) {
-    logger.error('Woo getProductById error', { id, message: err.message });
-    throw err;
-  }
+  };
+  return callWithResilience(fn, { circuit: { timeout: 10000 } });
 }
 
-async function getFeatured(perPage = 6) {
-  const client = baseClient();
-  try {
-    const resp = await client.get('/products', { params: { featured: true, per_page: perPage } });
+export async function createOrder(order) {
+  if (!order) throw new Error('order required');
+  const fn = async () => {
+    const client = buildClient();
+    const resp = await client.post(`/orders`, order);
     return resp.data;
-  } catch (err) {
-    logger.error('Woo getFeatured error', { message: err.message });
-    throw err;
-  }
+  };
+  return callWithResilience(fn, { circuit: { timeout: 15000 } });
 }
 
-async function getBestSellers(perPage = 6) {
-  const client = baseClient();
-  try {
-    const resp = await client.get('/products', { params: { orderby: 'popularity', per_page: perPage } });
-    return resp.data;
-  } catch (err) {
-    logger.error('Woo getBestSellers error', { message: err.message });
-    throw err;
-  }
+export async function updateInventory(sku, quantity) {
+  if (!sku) throw new Error('sku required');
+  const fn = async () => {
+    const client = buildClient();
+    // WooCommerce inventory update varies; this example patches a product by SKU
+    const resp = await client.get(`/products`, { params: { sku } });
+    const prod = resp.data && resp.data[0];
+    if (!prod) throw new Error('product not found');
+    const updateResp = await client.put(`/products/${prod.id}`, { stock_quantity: quantity });
+    return updateResp.data;
+  };
+  return callWithResilience(fn, { circuit: { timeout: 10000 } });
 }
 
-async function createOrder(orderData) {
-  const client = baseClient();
-  try {
-    const resp = await client.post('/orders', orderData);
-    return resp.data;
-  } catch (err) {
-    logger.error('Woo createOrder error', { message: err.message, orderData });
-    throw err;
-  }
-}
-
-async function getOrder(orderId) {
-  const client = baseClient();
-  try {
-    const resp = await client.get(`/orders/${orderId}`);
-    return resp.data;
-  } catch (err) {
-    logger.error('Woo getOrder error', { orderId, message: err.message });
-    throw err;
-  }
-}
-
-export default {
-  searchProducts,
-  getProductById,
-  getFeatured,
-  getBestSellers,
-  createOrder,
-  getOrder
-};
+export default { getOrder, createOrder, updateInventory };
