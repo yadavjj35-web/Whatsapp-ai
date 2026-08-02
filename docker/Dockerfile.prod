@@ -1,0 +1,55 @@
+# path: docker/Dockerfile.prod
+# Multi-stage Dockerfile for production Node 20 image
+# - Produces a minimal runtime image
+# - Uses non-root user for security
+# - Installs only production dependencies
+# - Copies only necessary files
+
+# Build stage
+FROM node:20-alpine AS build
+
+# install build deps
+RUN apk add --no-cache python3 make g++ libc6-compat git
+
+# Create app directory
+WORKDIR /usr/src/app
+
+# Install dependencies (copy package.json and lock file first for caching)
+COPY package.json package-lock.json* ./
+
+# Install production deps only (we will install dev deps optionally if needed)
+RUN npm ci --only=production
+
+# Copy application sources
+COPY . .
+
+# Remove dev files if present
+RUN rm -rf tests docs .github
+
+# Production runtime stage (smaller)
+FROM node:20-alpine AS runtime
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+WORKDIR /usr/src/app
+
+# Copy from build stage
+COPY --from=build /usr/src/app ./
+
+# Ensure node_modules exist and ownership is correct
+RUN chown -R appuser:appgroup /usr/src/app
+
+ENV NODE_ENV=production
+ENV PORT=3000
+
+# Expose port
+EXPOSE 3000
+
+# Use non-root user
+USER appuser
+
+# Healthcheck (simple HTTP GET /health)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- --timeout=2 http://localhost:${PORT}/health || exit 1
+
+# Start command
+CMD ["node", "server.js"]
