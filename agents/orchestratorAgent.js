@@ -1,83 +1,82 @@
-// path: /agents/orchestratorAgent.js
+// path: agents/orchestratorAgent.js
 /**
- * Central AI Executive - Orchestrator Agent
- * Responsibilities:
- * - Accept high-level owner commands
- * - Break tasks into smaller tasks using taskPlanner
- * - Route tasks to appropriate agents via toolRouter
- * - Monitor progress via workflowCoordinator
- * - Aggregate results and return final output
+ * Orchestrator Agent
  *
- * This module exposes a single class OrchestratorAgent with an async `execute` method.
+ * Responsible for:
+ *  - Accepting high-level tasks/requests and turning them into durable workflows
+ *  - Creating Workflow documents (models/Workflow)
+ *  - Enqueuing tasks via queue/queueManager
+ *  - Exposing an API for other services to start/cancel/inspect workflows
+ *
+ * The orchestrator uses the DurableWorkflowEngine (workflows/durableWorkflowEngine.js).
  */
 
-import EventEmitter from 'events';
 import logger from '../utils/logger.js';
-import taskPlanner from './taskPlanner.js';
-import toolRouter from './toolRouter.js';
-import workflowCoordinator from './workflowCoordinator.js';
+import engine from '../workflows/durableWorkflowEngine.js';
+import Workflow from '../models/Workflow.js';
+import queueManager from '../queue/queueManager.js';
 
-class OrchestratorAgent extends EventEmitter {
-  constructor(opts = {}) {
-    super();
-    this.name = 'orchestrator';
-    this.description = 'Central AI Executive responsible for decomposing and routing tasks to agents';
-    this.timeoutMs = opts.timeoutMs || 5 * 60 * 1000; // 5 minutes default
+class OrchestratorAgent {
+  /**
+   * Create and optionally start a new workflow.
+   * options:
+   *  - name, owner, correlationId, metadata, tasks: [{ id?, type, agent, input }]
+   *  - startImmediately (default true)
+   */
+  async createAndStartWorkflow(options = {}) {
+    if (!options || !Array.isArray(options.tasks) || options.tasks.length === 0) {
+      throw new Error('createAndStartWorkflow requires tasks array');
+    }
+    const wf = await engine.createWorkflow({ ...options, startImmediately: false });
+    if (options.startImmediately !== false) {
+      await engine.startWorkflow(wf.workflowId);
+    }
+    logger.info('Orchestrator created workflow', { workflowId: wf.workflowId, tasks: wf.tasks.length });
+    return wf;
   }
 
   /**
-   * Execute a high-level task.
-   * @param {Object} context - { owner, command, payload, user }
-   * @returns {Object} result - aggregated result
+   * Enqueue a single task directly (without workflow persistence).
+   * Useful for ad-hoc tasks.
    */
-  async execute(context = {}) {
-    const start = Date.now();
-    const id = `orch-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    logger.info('Orchestrator starting execution', { id, context: { command: context.command } });
+  async enqueueTask(task) {
+    if (!task || !task.type || !task.agent) throw new Error('task must include type and agent');
+    const payload = {
+      id: task.id,
+      type: task.type,
+      agent: task.agent,
+      input: task.input,
+      metadata: task.metadata || {}
+    };
+    const res = await queueManager.enqueueTask(payload);
+    logger.debug('Orchestrator enqueued ad-hoc task', { taskId: payload.id, queue: res.queueName });
+    return res;
+  }
 
-    try {
-      // 1. Plan tasks
-      const plan = await taskPlanner.plan(context);
-      logger.info('TaskPlanner produced plan', { id, planSummary: plan.summary || null });
+  /**
+   * Cancel a workflow
+   */
+  async cancelWorkflow(workflowId, reason = 'cancelled by orchestrator') {
+    const wf = await engine.cancelWorkflow(workflowId, reason);
+    logger.info('Orchestrator cancelled workflow', { workflowId, reason });
+    return wf;
+  }
 
-      // 2. Route tasks to tools/agents
-      const tasks = plan.tasks || [];
-      const results = [];
+  /**
+   * Inspect workflow
+   */
+  async getWorkflow(workflowId) {
+    const wf = await Workflow.findOne({ workflowId }).lean();
+    return wf;
+  }
 
-      // Register with workflow coordinator for tracking
-      await workflowCoordinator.registerWorkflow(id, { context, plan });
-
-      for (const task of tasks) {
-        // check for cancellation or approval requirements
-        workflowCoordinator.markTaskStarted(id, task);
-
-        try {
-          const result = await toolRouter.routeTask(task, { orchestratorId: id });
-          results.push({ taskId: task.id, success: true, result });
-          workflowCoordinator.markTaskSucceeded(id, task, result);
-        } catch (err) {
-          logger.error('ToolRouter task error', { id, taskId: task.id, error: err.message });
-          results.push({ taskId: task.id, success: false, error: err.message });
-          workflowCoordinator.markTaskFailed(id, task, err);
-          // Decide whether to continue or abort based on plan policy
-          if (plan.abortOnFailure) {
-            throw new Error(`Aborting plan due to task failure: ${task.id}`);
-          }
-        }
-      }
-
-      // 3. Aggregate
-      const finalResult = { id, command: context.command, results, durationMs: Date.now() - start };
-
-      await workflowCoordinator.markWorkflowCompleted(id, finalResult);
-      logger.info('Orchestrator completed execution', { id, durationMs: finalResult.durationMs });
-
-      return finalResult;
-    } catch (err) {
-      logger.error('Orchestrator execution error', { id, error: err.message });
-      await workflowCoordinator.markWorkflowFailed(id, { error: err.message });
-      throw err;
-    }
+  /**
+   * Recover and resume in-progress workflows (delegates to engine.recoverStaleWorkflows)
+   */
+  async recoverStale({ thresholdMs } = {}) {
+    const count = await engine.recoverStaleWorkflows({ thresholdMs });
+    logger.info('Orchestrator recovered stale workflows', { recoveredCount: count });
+    return count;
   }
 }
 
