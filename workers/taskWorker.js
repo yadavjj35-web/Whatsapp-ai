@@ -1,27 +1,9 @@
 // path: workers/taskWorker.js
 /**
- * workers/taskWorker.js
+ * workers/taskWorker.js (updated)
  *
- * BullMQ Worker that consumes 'tasks' queue, executes tasks using the
- * agent toolRouter / agentRegistry, and updates workflow persistence.
- *
- * Responsibilities:
- *  - Claim job and set progress
- *  - Validate job payload
- *  - Execute via agentRegistry/toolRouter
- *  - Update Workflow model with task status/result
- *  - Emit structured logs and audit events
- *  - Handle retries, failures, and dead-letter handling
- *
- * Requirements:
- *  - Requires queue/redisClient.js and queue/queueManager.js to be initialized
- *  - Requires agents/toolRouter.js and agents/agentRegistry.js to be present
- *  - Requires models/Workflow.js for persistence
- *
- * Environment variables:
- *  - WORKER_CONCURRENCY (default 4)
- *  - QUEUE_NAME_TASKS (default 'tasks')
- *  - WORKER_LOCK_TTL_MS (default 60000)
+ * Adds audit logging on job success/failure using utils/auditLogger.
+ * Assumes agentRegistry, toolRegistry, Workflow model already present.
  */
 
 import { Worker } from 'bullmq';
@@ -33,6 +15,7 @@ import toolRegistry from '../tools/toolRegistry.js';
 import Workflow from '../models/Workflow.js';
 import { jobSummary } from '../queue/queueUtils.js';
 import { v4 as uuidv4 } from 'uuid';
+import auditLogger from '../utils/auditLogger.js';
 
 const QUEUE_NAME_TASKS = process.env.QUEUE_NAME_TASKS || 'tasks';
 const QUEUE_PREFIX = process.env.QUEUE_PREFIX || 'waai';
@@ -41,9 +24,6 @@ const WORKER_LOCK_TTL_MS = Number(process.env.WORKER_LOCK_TTL_MS || 60000);
 
 const qualifiedQueueName = `${QUEUE_PREFIX}:${QUEUE_NAME_TASKS}`;
 
-/**
- * Execute a single job
- */
 async function executeJob(job) {
   const jobId = job.id;
   const jobName = job.name;
@@ -54,27 +34,24 @@ async function executeJob(job) {
   const summary = jobSummary(jobName, jobId, workflowId);
   logger.info('Worker picked job', { summary });
 
-  // Basic validation
   if (!payload || !payload.type || !payload.agent) {
     const err = new Error('Invalid job payload: missing type or agent');
     logger.error('Invalid job payload', { jobId, payload });
     throw err;
   }
 
-  const agentName = payload.agent;
-
-  // Load agent
-  const agent = agentRegistry.getAgent(agentName);
+  const agent = agentRegistry.getAgent(payload.agent);
   if (!agent) {
-    const err = new Error(`Agent not registered: ${agentName}`);
-    logger.error('Agent not found', { agentName, jobId });
-    // Update workflow if attached
+    const err = new Error(`Agent not registered: ${payload.agent}`);
+    logger.error('Agent not found', { agentName: payload.agent, jobId });
+    // update workflow
     if (workflowId) {
       try {
         const wf = await Workflow.findOne({ workflowId });
         if (wf) {
-          await wf.appendLog('error', 'Agent not found', { agentName, jobId });
-          await wf.updateTask(taskId, { status: 'failed', error: `Agent ${agentName} not found`, finishedAt: new Date() });
+          await wf.updateTask(taskId, { status: 'failed', error: `Agent ${payload.agent} not found`, finishedAt: new Date() });
+          await wf.appendLog('error', 'Agent not found', { taskId, jobId });
+          await auditLogger.writeAudit({ category: 'workflow', action: 'task_agent_missing', actor: 'worker', message: `Agent ${payload.agent} not found`, details: { workflowId, taskId, jobId }, correlationId: workflowId });
         }
       } catch (e) {
         logger.warn('Failed to update workflow for missing agent', { workflowId, error: e.message });
@@ -83,92 +60,101 @@ async function executeJob(job) {
     throw err;
   }
 
-  // Create tools context for the agent
-  const tools = toolRegistry.createToolContext({ agentName });
+  const tools = await toolRegistry.createToolContext({ agentName: payload.agent });
 
-  // Update workflow task -> running
   if (workflowId) {
     try {
       const wf = await Workflow.findOne({ workflowId });
       if (wf) {
         await wf.updateTask(taskId, { status: 'running', startedAt: new Date() });
-        await wf.appendLog('info', 'Task started', { taskId, agentName, jobId });
+        await wf.appendLog('info', 'Task started', { taskId, agent: payload.agent, jobId });
       }
     } catch (err) {
       logger.warn('Failed to mark task running in workflow', { workflowId, taskId, error: err.message });
     }
   }
 
-  // Execute agent with a timeout monitored at application level if needed
-  let result = null;
   try {
-    // Agent execute() should be async and handle its own errors
-    if (typeof agent.execute !== 'function') {
-      throw new Error(`Agent ${agentName} missing execute()`);
-    }
+    const result = await agent.execute(payload, tools, { jobId, taskId, workflowId });
 
-    // Allow agent.execute to receive task payload, tools, and job meta
-    result = await agent.execute(payload, tools, { jobId, taskId, workflowId });
-
-    logger.info('Agent execution succeeded', { agentName, taskId, jobId, workflowId });
-
-    // Update workflow with success
+    // success updates
     if (workflowId) {
       try {
         const wf = await Workflow.findOne({ workflowId });
         if (wf) {
           await wf.updateTask(taskId, { status: 'succeeded', result, finishedAt: new Date() });
-          await wf.appendLog('info', 'Task succeeded', { taskId, agentName, jobId });
+          await wf.appendLog('info', 'Task succeeded', { taskId, agent: payload.agent, jobId });
         }
       } catch (err) {
         logger.warn('Failed to persist task success to workflow', { workflowId, taskId, error: err.message });
       }
     }
 
+    // Audit entry
+    try {
+      await auditLogger.writeAudit({
+        category: 'workflow',
+        action: 'task_succeeded',
+        actor: `agent:${payload.agent}`,
+        actorType: 'agent',
+        message: `Task ${taskId} succeeded`,
+        details: { jobId, workflowId, taskId, result },
+        correlationId: workflowId
+      });
+    } catch (e) {
+      // ignore
+    }
+
     return result;
   } catch (err) {
-    logger.error('Agent execution failed', { agentName, taskId, jobId, workflowId, error: err && (err.message || String(err)) });
+    logger.error('Agent execution failed', { agent: payload.agent, taskId, jobId, workflowId, error: err && (err.message || String(err)) });
 
-    // Update workflow with failure
     if (workflowId) {
       try {
         const wf = await Workflow.findOne({ workflowId });
         if (wf) {
           await wf.updateTask(taskId, { status: 'failed', error: { message: err.message || String(err), stack: err.stack }, finishedAt: new Date() });
-          await wf.appendLog('error', 'Task failed', { taskId, agentName, jobId, error: err.message });
+          await wf.appendLog('error', 'Task failed', { taskId, agent: payload.agent, jobId, error: err.message });
         }
       } catch (e) {
         logger.warn('Failed to persist task failure to workflow', { workflowId, taskId, error: e.message });
       }
     }
 
-    // Rethrow to allow BullMQ to handle attempts/backoff
+    // Audit failure
+    try {
+      await auditLogger.writeAudit({
+        category: 'workflow',
+        action: 'task_failed',
+        actor: `agent:${payload.agent}`,
+        actorType: 'agent',
+        message: `Task ${taskId} failed`,
+        details: { jobId, workflowId, taskId, error: err && (err.message || String(err)) },
+        correlationId: workflowId
+      });
+    } catch (e) {
+      // ignore
+    }
+
     throw err;
   }
 }
 
-/**
- * Create and start the worker instance.
- * Returns the Worker instance.
- */
 function startWorker() {
   logger.info('Starting task worker', { queue: qualifiedQueueName, concurrency: CONCURRENCY });
-
   const connection = redisClient.getRedis();
 
   const worker = new Worker(
     qualifiedQueueName,
     async (job) => {
-      // job processor
-      // Update job progress at start
       try {
-        await job.updateProgress({ status: 'started', ts: Date.now() });
+        await job.updateProgress({ status: 'started', ts: Date.now() }).catch(() => {});
       } catch (e) {
-        // non-fatal
+        // ignore
       }
       const result = await executeJob(job);
       try {
-        await job.updateProgress({ status: 'finished', ts: Date.now() });
+        await job.updateProgress({ status: 'finished', ts: Date.now() }).catch(() => {});
       } catch (e) {
         // ignore
       }
@@ -181,24 +167,13 @@ function startWorker() {
     }
   );
 
-  // Worker event handlers for observability and logging
-  worker.on('active', (job) => {
-    logger.info('Job active', { id: job.id, name: job.name, queue: qualifiedQueueName });
-  });
-
-  worker.on('completed', (job, returnvalue) => {
-    logger.info('Job completed', { id: job.id, name: job.name, queue: qualifiedQueueName });
-  });
-
+  worker.on('active', (job) => logger.info('Job active', { id: job.id, name: job.name, queue: qualifiedQueueName }));
+  worker.on('completed', (job) => logger.info('Job completed', { id: job.id, name: job.name, queue: qualifiedQueueName }));
   worker.on('failed', async (job, err) => {
     logger.error('Job failed', { id: job?.id, name: job?.name, queue: qualifiedQueueName, error: err?.message });
   });
+  worker.on('error', (err) => logger.error('Worker error', { queue: qualifiedQueueName, error: err?.message }));
 
-  worker.on('error', (err) => {
-    logger.error('Worker error', { queue: qualifiedQueueName, error: err?.message });
-  });
-
-  // Ensure graceful shutdown when requested
   async function shutdown({ timeoutMs = 30000 } = {}) {
     logger.info('Shutting down worker', { queue: qualifiedQueueName });
     try {
@@ -214,9 +189,7 @@ function startWorker() {
     }
   }
 
-  // Attach shutdown helper for external orchestrator
   worker.shutdown = shutdown;
-
   return worker;
 }
 
