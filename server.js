@@ -1,103 +1,329 @@
-import dotenv from 'dotenv';
-dotenv.config();
+// path: server.js
+/**
+ * Updated server.js (production-ready)
+ *
+ * Responsibilities:
+ *  - Initialize DB/Redis/queues/workers/tracing/metrics
+ *  - Mount new controllers (workflows, approvals, payments, admin, metrics)
+ *  - Provide webhook raw-body capture for signature verification
+ *  - Graceful shutdown of workers, queues, Redis, tracing, shipper
+ *  - Security middlewares: helmet, cors, rate limiting, auth/rbac hooks (where appropriate)
+ *
+ * Notes:
+ *  - Expects other modules (created/updated) to be present:
+ *      - queue/redisClient.js, queue/queueManager.js, workers/taskWorker.js
+ *      - monitoring/otel.js, monitoring/metrics.js
+ *      - controllers/workflowController.js, controllers/approvalController.js
+ *      - controllers/paymentWebhookController.js, controllers/adminApi.js
+ *      - controllers/metricsController.js
+ *      - auth/oidcClient.js (authMiddleware), middleware/rbac.js (rbac)
+ *      - logging/shipper.js (optional)
+ *
+ * Usage:
+ *  node server.js
+ */
 
 import express from 'express';
+import http from 'http';
 import helmet from 'helmet';
 import cors from 'cors';
-import morgan from 'morgan';
-import config from './config/index.js';
-import { connectDB } from './database/mongoose.js';
-import routes from './routes/index.js';
-import rateLimiter from './middleware/rateLimiter.js';
-import { errorHandler } from './middleware/errorHandler.js';
+import compression from 'compression';
+import cookieParser from 'cookie-parser';
+import { fileURLToPath } from 'url';
+import path from 'path';
 import logger from './utils/logger.js';
+import redisClient from './queue/redisClient.js';
+import queueManager from './queue/queueManager.js';
+import taskWorker from './workers/taskWorker.js';
+import otel from './monitoring/otel.js';
+import metrics from './monitoring/metrics.js';
+import shipper from './logging/shipper.js';
+import rateLimiterPerUser from './middleware/rateLimiterPerUser.js';
+import { authMiddleware } from './auth/oidcClient.js';
+import rbac from './middleware/rbac.js';
 
-// Create Express app
+// controllers (existing/updated)
+import workflowController from './controllers/workflowController.js';
+import approvalController from './controllers/approvalController.js';
+import paymentWebhookController from './controllers/paymentWebhookController.js';
+import adminApi from './controllers/adminApi.js';
+import metricsController from './controllers/metricsController.js';
+
+// existing controllers that remain (if present)
+import whatsappController from './controllers/whatsappController.js';
+
+// Create app
 const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const serverStartTimeout = Number(process.env.SERVER_START_TIMEOUT_MS || 30000);
 
-// Raw body capture to support webhook signature verification (x-hub-signature-256).
-// whatsappVerifier middleware expects req.rawBody to compute HMAC.
-// The verify option provides the raw buffer before parsing into JSON.
+let httpServer = null;
+let workerInstance = null;
+let tracingStarted = false;
+
+/**
+ * Middleware to capture raw body for webhook signature verification.
+ * This must be applied before express.json() if you want rawBody for specific routes,
+ * or use express.raw() at route-level. We'll capture raw for all JSON/text bodies safely.
+ */
 function rawBodySaver(req, res, buf, encoding) {
   if (buf && buf.length) {
     req.rawBody = buf.toString(encoding || 'utf8');
   }
 }
 
-// Security middlewares
+// Standard middlewares
 app.use(helmet());
+app.use(cors({ origin: process.env.CORS_ORIGIN || true }));
+app.use(compression());
+app.use(cookieParser());
 
-// Body parsers with raw body capture
-app.use(express.json({ limit: '2mb', verify: rawBodySaver }));
-app.use(express.urlencoded({ extended: true, limit: '2mb', verify: rawBodySaver }));
+// JSON parser with raw capture
+app.use(express.json({ limit: '1mb', verify: rawBodySaver }));
+app.use(express.urlencoded({ extended: true, limit: '1mb', verify: rawBodySaver }));
 
-// CORS - allow requests from configured origins in production (adjust as needed)
-app.use(cors({ origin: true }));
+// Prometheus metrics middleware
+app.use(metrics.metricsMiddleware);
 
-// Rate limiter
-app.use(rateLimiter);
+// Basic request logging (uses your utils/logger)
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const dur = Date.now() - start;
+    logger.info('http.request', {
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      durationMs: dur,
+      ip: req.ip
+    });
+  });
+  next();
+});
 
-// Request logging
-if (config.nodeEnv === 'development') {
-  app.use(morgan('dev'));
-} else {
-  app.use(morgan('combined'));
+// Rate limiting per user
+app.use(rateLimiterPerUser);
+
+// Mount routes
+app.use('/api/v1/workflows', workflowController);
+app.use('/api/v1/approvals', approvalController);
+
+// Payment webhooks — the controller expects express.raw at route-level, but mounting under /webhooks is fine
+app.use('/webhooks', paymentWebhookController);
+
+// WhatsApp webhook (existing), mount if exists
+if (whatsappController) {
+  app.use('/webhook/whatsapp', whatsappController);
 }
 
-// Mount API routes under /api/v1
-app.use('/api/v1', routes);
+// Admin API: protected by OIDC auth + RBAC admin role
+app.use('/api/v1/admin', authMiddleware(), rbac('admin'), adminApi);
 
-// Basic root
-app.get('/', (req, res) => res.json({ success: true, message: 'AI WhatsApp Sales Assistant API' }));
+// Metrics endpoint (prometheus)
+app.use('/', metricsController);
 
-// Error handler (must be last)
-app.use(errorHandler);
-
-// Start server and DB connection
-const port = config.port || process.env.PORT || 3000;
-
-async function start() {
+// Health endpoint
+app.get('/health', async (req, res) => {
   try {
-    // Connect to MongoDB
-    await connectDB();
+    // Redis health
+    const redisHealth = await redisClient.checkRedisHealth().catch((e) => ({ ok: false, reason: e.message }));
+    // Mongo health (mongoose)
+    let mongoState = 'unknown';
+    try {
+      // lazy import to avoid circular require
+      const mongoose = (await import('mongoose')).default;
+      const readyState = mongoose.connection.readyState; // 1 = connected
+      mongoState = readyState === 1 ? 'connected' : `state_${readyState}`;
+    } catch (e) {
+      mongoState = `error:${e.message}`;
+    }
 
-    const server = app.listen(port, () => {
-      logger.info(`Server listening on port ${port} (env=${config.nodeEnv})`);
-      // Print basic startup info
-      logger.info('Ready endpoints', { health: `/api/v1/health`, webhook: `/api/v1/webhook` });
-    });
+    // Queue metrics
+    let queueMetrics = {};
+    try {
+      queueMetrics = await queueManager.getQueueMetrics();
+    } catch (e) {
+      queueMetrics = { error: e.message };
+    }
 
-    // Graceful shutdown
-    const shutdown = async () => {
-      logger.info('Shutting down gracefully...');
-      server.close(() => {
-        logger.info('HTTP server closed');
-        // allow DB driver to close itself
-        process.exit(0);
-      });
-      // Force exit if not closed in 30s
-      setTimeout(() => {
-        logger.error('Forcefully exiting process after timeout');
-        process.exit(1);
-      }, 30000).unref();
+    const status = {
+      redis: redisHealth,
+      mongo: mongoState,
+      queues: queueMetrics,
+      uptime: process.uptime(),
+      timestamp: new Date().toISOString()
     };
 
+    const ok = (redisHealth && redisHealth.ok) || false;
+    res.status(ok ? 200 : 500).json({ success: ok, status });
+  } catch (err) {
+    logger.error('Health check failed', { error: err.message });
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * Startup sequence:
+ *  - init tracing
+ *  - init redis/queue
+ *  - start worker(s)
+ *  - start HTTP server
+ */
+async function start() {
+  try {
+    logger.info('Server starting - initializing observability and infra');
+
+    // Start OpenTelemetry (non-blocking)
+    try {
+      await otel.startTracing();
+      tracingStarted = true;
+    } catch (err) {
+      logger.warn('OTel start failure', { error: err.message });
+    }
+
+    // Start shipper if configured
+    try {
+      shipper.init && shipper.init();
+    } catch (e) {
+      logger.warn('Log shipper init failed', { error: e.message });
+    }
+
+    // Initialize Redis connection and wait until ready
+    try {
+      redisClient.initRedis();
+      await redisClient.waitUntilReady();
+      logger.info('Redis ready');
+    } catch (err) {
+      logger.error('Redis initialization failed', { error: err.message });
+      throw err;
+    }
+
+    // Warm up queue manager (ensure scheduler created)
+    try {
+      queueManager.createQueue(); // default queue
+      logger.info('Queue manager initialized');
+    } catch (err) {
+      logger.error('Queue manager init failed', { error: err.message });
+      throw err;
+    }
+
+    // Start worker for tasks
+    try {
+      workerInstance = taskWorker.startWorker();
+      logger.info('Task worker started');
+    } catch (err) {
+      logger.error('Worker startup failed', { error: err.message });
+      throw err;
+    }
+
+    // Start HTTP server
+    httpServer = http.createServer(app);
+    await new Promise((resolve, reject) => {
+      const to = setTimeout(() => reject(new Error('Server start timed out')), serverStartTimeout);
+      httpServer.listen(PORT, () => {
+        clearTimeout(to);
+        logger.info('Server listening', { port: PORT });
+        resolve();
+      });
+    });
+
+    // Graceful shutdown handlers
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
     process.on('uncaughtException', (err) => {
-      logger.error('Uncaught exception', { message: err.message, stack: err.stack });
-      shutdown();
+      logger.error('Uncaught exception', { error: err && (err.stack || err.message) });
+      // Attempt graceful shutdown, then exit
+      shutdown().finally(() => process.exit(1));
     });
     process.on('unhandledRejection', (reason) => {
-      logger.error('Unhandled rejection', { reason });
+      logger.error('Unhandled rejection', { reason: String(reason) });
     });
-
   } catch (err) {
-    logger.error('Failed to start server', err);
+    logger.error('Failed to start server', { error: err.message });
+    // Ensure process exits if failed to start
+    await shutdown();
     process.exit(1);
   }
 }
 
-start();
+/**
+ * Graceful shutdown
+ */
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info('Shutdown initiated');
+
+  // Stop accepting new connections
+  try {
+    if (httpServer) {
+      logger.info('Closing HTTP server');
+      await new Promise((resolve) => {
+        httpServer.close(() => resolve());
+        // also set a safety timeout
+        setTimeout(resolve, 10_000).unref();
+      });
+    }
+  } catch (err) {
+    logger.warn('Error closing HTTP server', { error: err.message });
+  }
+
+  // Stop worker
+  try {
+    if (workerInstance && typeof workerInstance.shutdown === 'function') {
+      logger.info('Shutting down worker');
+      await workerInstance.shutdown({ timeoutMs: Number(process.env.WORKER_SHUTDOWN_TIMEOUT_MS || 30000) });
+    }
+  } catch (err) {
+    logger.warn('Worker shutdown error', { error: err.message });
+  }
+
+  // Shutdown queue managers (schedulers)
+  try {
+    await queueManager.shutdownAll({ timeoutMs: Number(process.env.QUEUE_SHUTDOWN_TIMEOUT_MS || 30000) });
+  } catch (err) {
+    logger.warn('Queue manager shutdown error', { error: err.message });
+  }
+
+  // Shutdown Redis
+  try {
+    await redisClient.shutdownRedis();
+  } catch (err) {
+    logger.warn('Redis shutdown error', { error: err.message });
+  }
+
+  // Shutdown shipper
+  try {
+    if (shipper && typeof shipper.shutdown === 'function') {
+      await shipper.shutdown();
+    }
+  } catch (err) {
+    logger.warn('Log shipper shutdown error', { error: err.message });
+  }
+
+  // Shutdown tracing
+  try {
+    if (tracingStarted) {
+      await otel.shutdownTracing();
+    }
+  } catch (err) {
+    logger.warn('Tracing shutdown error', { error: err.message });
+  }
+
+  logger.info('Shutdown complete');
+  // allow process to exit naturally
+}
+
+/**
+ * If executed directly, start the server
+ */
+if (import.meta.url === `file://${process.cwd()}/${path.basename(process.argv[1] || 'server.js')}` || process.argv[1] && process.argv[1].endsWith('server.js')) {
+  // Top-level start
+  start().catch((e) => {
+    logger.error('Fatal startup error', { error: e.message });
+    process.exit(1);
+  });
+}
 
 export default app;
